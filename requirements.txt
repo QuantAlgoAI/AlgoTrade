@@ -20,7 +20,7 @@ kaleido==0.2.1  # For static image export
 # Utilities
 python-dateutil==2.8.2
 pytz==2023.3
-requests==2.31.0
+requests==2.32.2
 websocket-client==1.7.0
 matplotlib==3.8.2
 seaborn==0.13.0
