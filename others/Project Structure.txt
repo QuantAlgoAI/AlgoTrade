@@ -1,0 +1,58 @@
+Project Structure Report
+===================================
+- This report provides the directory structure of the project.
+- The .venv directory has been skipped.
+- The node_modules directory has been skipped.
+- Duplicate files and folders are listed at the end.
+===================================
+
+|-- MS/
+|   |-- .env
+|   |-- 20250522_instrument_file.csv
+|   |-- AlgoTrade.py
+|   |-- ARCHITECTURE.md
+|   |-- backup.py
+|   |-- config.py
+|   |-- docker-compose.yml
+|   |-- Dockerfile
+|   |-- models.py
+|   |-- notifier.py
+|   |-- README.md
+|   |-- requirements.txt
+|   |-- run_trading_bot.bat
+|   |-- security.py
+|   |-- setup_wsl.bat
+|   |-- verify_wsl.bat
+|   |-- data_cache/
+|   |-- logs/
+|   |   |-- trading_20250521.log
+|   |   |-- trading_20250522.log
+|   |   |-- 2025-04-28/
+|   |   |   |-- app.log
+|   |   |-- 2025-04-29/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-06/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-07/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-08/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-21/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-22/
+|   |   |   |-- app.log
+|   |-- __pycache__/
+|   |   |-- AlgoTrade.cpython-311.pyc
+|   |   |-- api_utils.cpython-311.pyc
+|   |   |-- config.cpython-311.pyc
+|   |   |-- database.cpython-311.pyc
+|   |   |-- models.cpython-311.pyc
+|   |   |-- notifier.cpython-311.pyc
+|   |   |-- nse_robust_fetch.cpython-311.pyc
+|   |   |-- optimized_strategy.cpython-311.pyc
+|   |   |-- option_chain_monitor.cpython-311.pyc
+
+Duplicate Files:
+- app.log (found 7 times)
+
+Duplicate Folders:

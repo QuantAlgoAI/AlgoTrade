@@ -1,0 +1,28 @@
+version: '3'
+
+services:
+  trading_bot:
+    build: .
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    command: python AlgoTrade.py
+    container_name: algo_trading_bot
+    tty: true
+    stdin_open: true
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - trading_network
+
+networks:
+  trading_network:
+    driver: bridge 
