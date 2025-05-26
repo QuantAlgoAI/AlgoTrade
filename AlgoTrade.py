@@ -19,6 +19,11 @@ from scipy.stats import norm
 import math
 import csv
 from notifier import TelegramNotifier
+import pkg_resources
+from strategies.advanced_strategies import HighWinRateStrategy
+from config import API_KEY, CLIENT_CODE, PASSWORD, TOTP_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, STRATEGY_NAME
+from models import db, Trade
+from analytics import TradingAnalytics
 
 # === RETRY DECORATOR ===
 def retry_with_backoff(retries=3, backoff_in_seconds=1):
@@ -42,13 +47,6 @@ def retry_with_backoff(retries=3, backoff_in_seconds=1):
     return decorator
 
 # === CONFIGURATION ===
-API_KEY = "lB9qx6Rm"
-CLIENT_CODE = "R182159"
-PASSWORD = "1010"
-TOTP_SECRET = "NRXMU4SVMHCEW3H2KQ65IZKDGI"
-TELEGRAM_TOKEN = "7836552815:AAHuWTVdtz_vYInRH_f9SDLJBc8MkHoog0o"
-TELEGRAM_CHAT_ID = "7904363041"
-
 # Global variables
 smartapi_obj = None
 contract_hub_exchng = {}
@@ -72,6 +70,12 @@ map_dict = {
     'SENSEX': {'NAME': 'SENSEX', 'SYMBOL': 'SENSEX', 'TOKEN': '1', 'SEGMENT': 'BFO'},
     'BANKEX': {'NAME': 'BANKEX', 'SYMBOL': 'BANKEX', 'TOKEN': '2', 'SEGMENT': 'BFO'},
     'CRUDEOIL': {'NAME': 'CRUDEOIL', 'SYMBOL': 'CRUDEOIL', 'SEGMENT': 'MCX'},
+}
+
+# Strategy registry for dynamic selection
+STRATEGY_REGISTRY = {
+    'HighWinRateStrategy': HighWinRateStrategy,
+    # Add more strategies here as you create them
 }
 
 def black_scholes_greeks(S, K, T, r, sigma, option_type='call'):
@@ -144,7 +148,7 @@ def login_to_smartapi():
             
             # Check if the session data contains the required authentication tokens
             if 'jwtToken' not in session_data['data'] or 'refreshToken' not in session_data['data']:
-                raise Exception("Missing authentication tokens in session data")
+                raise Exception("Missing authentication tokens in session_data")
                 
             logging.info("Login successful")
             return obj, session_data
@@ -191,7 +195,26 @@ def preprocess_contract_hub_exchange():
                     return token
             
             df['token'] = df['token'].apply(safe_token_convert)
+
+            # Fix strike scale for index options (NIFTY, BANKNIFTY, etc.)
+            index_option_mask = (
+                (df['instrumenttype'] == 'OPTIDX') &
+                (df['name'].isin(['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']))
+            )
             
+            # Log before scaling
+            logging.info("Sample strikes before scaling:")
+            sample_strikes = df[index_option_mask].head()
+            logging.info(f"\n{sample_strikes[['symbol', 'strike', 'name']].to_string()}")
+            
+            # Scale down the strikes
+            df.loc[index_option_mask, 'strike'] = df.loc[index_option_mask, 'strike'] / 100
+            
+            # Log after scaling
+            logging.info("Sample strikes after scaling:")
+            sample_strikes = df[index_option_mask].head()
+            logging.info(f"\n{sample_strikes[['symbol', 'strike', 'name']].to_string()}")
+
             # Create filtered DataFrame, only including rows where token is numeric
             mask = df['token'].str.isdigit()
             filtered_df = df[mask & 
@@ -220,7 +243,26 @@ def preprocess_contract_hub_exchange():
                     return token
             
             df['token'] = df['token'].apply(safe_token_convert)
+
+            # Fix strike scale for index options (NIFTY, BANKNIFTY, etc.)
+            index_option_mask = (
+                (df['instrumenttype'] == 'OPTIDX') &
+                (df['name'].isin(['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']))
+            )
             
+            # Log before scaling
+            logging.info("Sample strikes before scaling:")
+            sample_strikes = df[index_option_mask].head()
+            logging.info(f"\n{sample_strikes[['symbol', 'strike', 'name']].to_string()}")
+            
+            # Scale down the strikes
+            df.loc[index_option_mask, 'strike'] = df.loc[index_option_mask, 'strike'] / 100
+            
+            # Log after scaling
+            logging.info("Sample strikes after scaling:")
+            sample_strikes = df[index_option_mask].head()
+            logging.info(f"\n{sample_strikes[['symbol', 'strike', 'name']].to_string()}")
+
             # Create filtered DataFrame, only including rows where token is numeric
             mask = df['token'].str.isdigit()
             filtered_df = df[mask & 
@@ -240,6 +282,15 @@ def preprocess_contract_hub_exchange():
         contract_hub_exchng = filtered_df.to_dict(orient='index')
         num_contracts = len(filtered_df)
         logging.info(f"[+] Loaded {num_contracts} valid contracts into contract hub")
+
+        # After contract hub is created, print a sample of NIFTY OPTIDX strikes for verification
+        try:
+            sample_nifty = df[(df['name'] == 'NIFTY') & (df['instrumenttype'] == 'OPTIDX')][['symbol', 'expiry', 'strike']].head(10)
+            print("Sample NIFTY OPTIDX contracts after preprocessing:")
+            print(sample_nifty)
+        except Exception as e:
+            print(f"Debug print failed: {e}")
+
         return contract_hub_exchng
         
     except Exception as e:
@@ -712,6 +763,13 @@ def select_trading_instrument():
 
 class SmartAPIWebSocket:
     def __init__(self, session_data, api_key, client_code, token_list):
+        # Monkey patch the SmartWebSocketV2 class to fix the callback issue
+        def patched_on_close(self, wsapp, close_status_code=None, close_msg=None, *args, **kwargs):
+            logging.info(f"WebSocket Closed with status: {close_status_code}, message: {close_msg}")
+            
+        # Apply the patch
+        SmartWebSocketV2._on_close = patched_on_close
+        
         self.sws = SmartWebSocketV2(
             session_data['data']['jwtToken'],
             api_key, 
@@ -719,76 +777,94 @@ class SmartAPIWebSocket:
             session_data['data']['feedToken']
         )
         self.token_list = token_list
-        self.smartapi_obj = None  # Will be set externally
+        self.smartapi_obj = None
         self.order_queue = []
         self.last_trade_prices = {}
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.reconnect_delay = 5
         self.setup_callbacks()
+
+    def handle_reconnection(self):
+        """Handle WebSocket reconnection with exponential backoff"""
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            self.reconnect_attempts += 1
+            delay = self.reconnect_delay * (2 ** (self.reconnect_attempts - 1))
+            logging.info(f"Attempting to reconnect in {delay} seconds (Attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})")
+            time.sleep(delay)
+            try:
+                self.start()
+            except Exception as e:
+                logging.error(f"Reconnection attempt failed: {str(e)}")
+                self.handle_reconnection()
+        else:
+            logging.error("Max reconnection attempts reached. Please restart the application.")
+            telegram_notifier.notify_error(
+                context="WebSocket",
+                message="Max reconnection attempts reached. Please restart the application."
+            )
+
+    def subscribe(self):
+        """Subscribe to market data with retry mechanism"""
+        try:
+            logging.info(f"Subscribing to tokens: {self.token_list}")
+            correlation_id = f"ws_{'_'.join(str(token) for token in self.token_list[0]['tokens'])}"
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.sws.subscribe(correlation_id=correlation_id, mode=3, token_list=self.token_list)
+                    logging.info(f"Subscription request sent with correlation_id: {correlation_id}")
+                    return
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logging.warning(f"Subscription attempt {attempt + 1} failed: {str(e)}")
+                    time.sleep(2 ** attempt)
+        except Exception as e:
+            logging.error(f"Error in subscription: {str(e)}")
+            self.handle_reconnection()
 
     def setup_callbacks(self):
         def on_ticks(wsapp, message):
             try:
                 logging.info(f"Tick: {message}")
-                token = str(message['token'])
-                ltp = float(message['last_traded_price']) / 100
-                self.last_trade_prices[token] = ltp
-                
-                # Process the tick with trading logic
-                self.process_tick_with_trading(message, token)
+                if isinstance(message, dict) and 'token' in message:
+                    token = str(message['token'])
+                    if 'last_traded_price' in message:
+                        ltp = float(message['last_traded_price']) / 100
+                        self.last_trade_prices[token] = ltp
+                        self.process_tick_with_trading(message, token)
             except Exception as e:
                 logging.error(f"Error in tick processing: {str(e)}")
             
         def on_open(wsapp):
             try:
                 logging.info("WebSocket Connected")
+                self.reconnect_attempts = 0
                 self.subscribe()
             except Exception as e:
                 logging.error(f"Error in WebSocket open: {str(e)}")
             
         def on_error(wsapp, error):
             logging.error(f"WebSocket Error: {error}")
-            self.reconnect()
-            
-        def on_close(wsapp):
-            logging.info("WebSocket Closed")
-            try:
-                self.reconnect()
-            except Exception as e:
-                logging.error(f"Error in reconnection: {str(e)}")
+            if "Connection refused" in str(error):
+                self.handle_reconnection()
         
+        # Set up the callbacks
         self.sws.on_open = on_open
         self.sws.on_data = on_ticks
         self.sws.on_error = on_error
-        self.sws.on_close = on_close
-
-    def subscribe(self):
-        """Subscribe to market data"""
-        try:
-            logging.info(f"Subscribing to tokens: {self.token_list}")
-            # Generate a unique correlation ID
-            tokens_string = '_'.join(str(token) for token in self.token_list[0]['tokens'])
-            correlation_id = f"ws_{tokens_string}"
-            self.sws.subscribe(correlation_id=correlation_id, mode=3, token_list=self.token_list)
-            logging.info(f"Subscription request sent with correlation_id: {correlation_id}")
-        except Exception as e:
-            logging.error(f"Error in subscription: {str(e)}")
-            raise
-    
-    def reconnect(self):
-        """Attempt to reconnect the websocket"""
-        try:
-            if not self.sws.is_connected():
-                logging.info("Attempting to reconnect...")
-                self.start()
-        except Exception as e:
-            logging.error(f"Reconnection failed: {str(e)}")
 
     def start(self):
-        """Start the websocket connection in a separate thread"""
+        """Start the websocket connection"""
         try:
-            threading.Thread(target=self.sws.connect).start()
+            logging.info("Starting WebSocket connection...")
+            self.sws.connect()
         except Exception as e:
             logging.error(f"Failed to start WebSocket: {str(e)}")
-    
+            self.handle_reconnection()
+
     def close(self):
         """Safely close the websocket connection"""
         try:
@@ -797,7 +873,8 @@ class SmartAPIWebSocket:
         except Exception as e:
             logging.error(f"Error closing WebSocket: {str(e)}")
 
-    def process_tick_with_trading(self, tick_data, token, qty=25, sl_pct=0.02, target_pct=0.05):
+    def process_tick_with_trading(self, tick_data, token):
+        """Process incoming tick data for trading decisions"""
         try:
             if token not in trade_state:
                 return
@@ -806,701 +883,60 @@ class SmartAPIWebSocket:
             time_stamp = datetime.fromtimestamp(int(tick_data['exchange_timestamp']) / 1000)
             trade_state[token]['ltp'] = ltp
             
-            # Get symbol details
             symbol_details = get_symbol_details(token)
             if not symbol_details:
                 return
                 
-            # Initialize strategy if not exists
-            if 'strategy' not in trade_state[token]:
-                trade_state[token]['strategy'] = HighWinRateStrategy(symbol_details['symbol'])
-                logging.info(f"Initialized strategy for {symbol_details['symbol']}")
-                
-            # Update strategy data
-            strategy = trade_state[token]['strategy']
-            strategy.update_data(tick_data)
-            signals = strategy.generate_signals()
+            logging.info(f"Processing tick for {symbol_details['symbol']} at {time_stamp}")
+            logging.info(f"LTP: {ltp}, Trade Status: {trade_state[token]['status']}")
             
-            logging.info(f"Current state for {symbol_details['symbol']}:")
-            logging.info(f"LTP: {ltp}")
-            logging.info(f"Trade Status: {trade_state[token]['status']}")
-            if not signals.empty:
-                logging.info(f"Current Signals: {signals.iloc[-1].to_dict()}")
-                
-            if signals.empty or len(signals) == 0:
-                return
-                
-            # Process trading signals
-            if trade_state[token]['status'] == 'IDLE':
-                if signals['final_signal'].iloc[-1] == 1:  # Buy signal
-                    # Calculate position size and risk parameters
-                    position_size = strategy.calculate_position_size(100000)  # Example account balance
-                    stop_loss = strategy.get_stop_loss(ltp, 1)
-                    take_profit = strategy.get_take_profit(ltp, 1)
-                    
-                    # Place order
-                    order_id = place_market_order(self.smartapi_obj, symbol_details, token, position_size, "BUY")
-                    if order_id:
-                        trade_state[token].update({
-                            'status': 'OPEN',
-                            'entry_price': ltp,
-                            'stop_loss': stop_loss,
-                            'target': take_profit,
-                            'order_id': order_id,
-                            'entry_time': time_stamp,
-                            'quantity': position_size
-                        })
-                        
-                        # Create trade record
-                        trade = Trade(
-                            symbol=symbol_details['symbol'],
-                            strike=symbol_details.get('strike'),
-                            option_type=symbol_details.get('option_type'),
-                            entry_price=ltp,
-                            quantity=position_size,
-                            entry_time=time_stamp
-                        )
-                        paper_trades.append(trade)
-                        
-                        # Get signal details
-                        signal_details = self._get_signal_details(signals)
-                        
-                        # Send notification using new notifier
-                        telegram_notifier.notify_trade_entry(
-                            trade={
-                                'symbol': symbol_details['symbol'],
-                                'strike': symbol_details.get('strike'),
-                                'option_type': symbol_details.get('option_type'),
-                                'entry_price': ltp,
-                                'quantity': position_size,
-                                'stop_loss': stop_loss,
-                                'target': take_profit
-                            },
-                            strategy="High Win-Rate Strategy",
-                            signal_details=signal_details
-                        )
-                        
-            elif trade_state[token]['status'] == 'OPEN':
-                # Check for exit conditions
-                exit_signal = False
-                exit_reason = ""
-                signal_details = ""
-                
-                if ltp <= trade_state[token]['stop_loss']:
-                    exit_signal = True
-                    exit_reason = "Stop Loss Hit"
-                    signal_details = "Price below stop loss"
-                elif ltp >= trade_state[token]['target']:
-                    exit_signal = True
-                    exit_reason = "Target Hit"
-                    signal_details = "Price above target"
-                elif signals['final_signal'].iloc[-1] == -1:
-                    exit_signal = True
-                    exit_reason = "Signal Reversal"
-                    signal_details = self._get_signal_details(signals)
-                
-                if exit_signal:
-                    # Place exit order
-                    exit_order_id = place_market_order(
-                        self.smartapi_obj, 
-                        symbol_details, 
-                        token, 
-                        trade_state[token]['quantity'], 
-                        "SELL"
-                    )
-                    
-                    if exit_order_id:
-                        # Update trade state
-                        trade_state[token]['status'] = 'IDLE'
-                        
-                        # Update trade record
-                        for trade in paper_trades:
-                            if (trade.symbol == symbol_details['symbol'] and 
-                                trade.status == "OPEN"):
-                                trade.close(
-                                    exit_price=ltp,
-                                    exit_time=time_stamp,
-                                    reason=exit_reason
-                                )
-                                
-                                # Send notification using new notifier
-                                telegram_notifier.notify_trade_exit(
-                                    trade={
-                                        'symbol': trade.symbol,
-                                        'exit_price': ltp,
-                                        'entry_time': trade.entry_time,
-                                        'exit_time': time_stamp,
-                                        'pnl': trade.pnl
-                                    },
-                                    strategy="High Win-Rate Strategy",
-                                    reason=exit_reason,
-                                    signal_details=signal_details
-                                )
-                                break
-                    
         except Exception as e:
-            logging.error(f"Error in tick processing: {str(e)}")
-            logging.error(f"Traceback: {traceback.format_exc()}")
+            logging.error(f"Error processing tick: {str(e)}")
             telegram_notifier.notify_error(
                 context="Tick Processing",
                 message=str(e)
             )
 
-    def _get_signal_details(self, signals):
-        """Extract signal details from the signals DataFrame"""
-        details = []
-        if signals['rsi_signal'].iloc[-1] != 0:
-            details.append(f"RSI {'Oversold' if signals['rsi_signal'].iloc[-1] == 1 else 'Overbought'}")
-        if signals['macd_signal'].iloc[-1] != 0:
-            details.append(f"MACD {'Bullish' if signals['macd_signal'].iloc[-1] == 1 else 'Bearish'}")
-        if signals['bb_signal'].iloc[-1] != 0:
-            details.append(f"Price {'Below' if signals['bb_signal'].iloc[-1] == 1 else 'Above'} BB")
-        if signals['volume_signal'].iloc[-1] != 0:
-            details.append("High Volume")
-        if signals['oi_signal'].iloc[-1] != 0:
-            details.append(f"OI {'Increasing' if signals['oi_signal'].iloc[-1] == 1 else 'Decreasing'}")
-        if signals['iv_signal'].iloc[-1] != 0:
-            details.append(f"IV {'Low' if signals['iv_signal'].iloc[-1] == 1 else 'High'}")
-        if signals['greeks_signal'].iloc[-1] != 0:
-            details.append(f"Greeks {'Favorable' if signals['greeks_signal'].iloc[-1] == 1 else 'Unfavorable'}")
-        
-        return ", ".join(details)
-
-class HighWinRateStrategy:
-    def __init__(self, contract_hub, account_balance=100000):
-        self.contract_hub = contract_hub
-        self.account_balance = account_balance
-        self.data = pd.DataFrame()
-        
-        # Technical Indicators
-        self.fast_ema_period = 9
-        self.slow_ema_period = 21
-        self.rsi_period = 14
-        self.volume_ma_period = 20
-        self.oi_ma_period = 20
-        self.atr_period = 14
-        
-        # Trade Management
-        self.trade_state = 'IDLE'  # IDLE, IN_TRADE
-        self.current_trade = None
-        self.last_trade_time = None
-        self.trading_start_time = datetime.strptime('09:15', '%H:%M').time()
-        self.trading_end_time = datetime.strptime('15:15', '%H:%M').time()
-        self.max_trades_per_day = 2
-        self.daily_loss_cap = 2000
-        self.daily_pnl = 0
-        self.trades_today = 0
-        
-        # Risk Management
-        self.trailing_sl_activated = False
-        self.trailing_sl_percentage = 0.20  # 20% in-the-money to activate trailing SL
-        self.trailing_sl_distance = 0.10    # 10% trailing distance
-        self.partial_exit_percentage = 0.50  # Exit 50% at first target
-        self.partial_exit_target = 0.20     # 20% profit for partial exit
-        
-        # Greeks thresholds
-        self.max_delta = 0.7
-        self.min_delta = 0.3
-        self.max_theta = -0.1
-        self.max_iv = 0.5  # 50% IV
-        
-        # Volume and OI thresholds
-        self.min_volume_increase = 1.1  # 10% increase
-        self.min_oi_increase = 1.05     # 5% increase
-        
-        # Market Context
-        self.market_regime = "UNKNOWN"
-        self.volatility_threshold = 0.02
-        self.support_levels = []
-        self.resistance_levels = []
-        
-    def calculate_rsi(self, data, period=14):
-        """Calculate RSI indicator"""
-        delta = data['ltp'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-        
-    def calculate_volume_ma(self, data, period=20):
-        """Calculate Volume Moving Average"""
-        return data['volume'].rolling(window=period).mean()
-        
-    def calculate_oi_ma(self, data, period=20):
-        """Calculate Open Interest Moving Average"""
-        return data['oi'].rolling(window=period).mean()
-        
-    def calculate_atr(self, data, period=14):
-        """Calculate Average True Range"""
-        high = data['high']
-        low = data['low']
-        close = data['close']
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean()
-        
-    def calculate_vwap(self, data):
-        """Calculate Volume Weighted Average Price"""
-        typical_price = (data['high'] + data['low'] + data['close']) / 3
-        volume_price = typical_price * data['volume']
-        cumulative_volume = data['volume'].cumsum()
-        cumulative_volume_price = volume_price.cumsum()
-        return cumulative_volume_price / cumulative_volume
-        
-    def find_support_resistance(self, data, window=20, threshold=0.02):
-        """Find support and resistance levels"""
-        highs = data['high'].rolling(window=window, center=True).max()
-        lows = data['low'].rolling(window=window, center=True).min()
-        
-        # Find local maxima and minima
-        resistance = highs[highs == data['high']]
-        support = lows[lows == data['low']]
-        
-        # Group nearby levels
-        self.resistance_levels = self.group_price_levels(resistance, threshold)
-        self.support_levels = self.group_price_levels(support, threshold)
-        
-    def group_price_levels(self, levels, threshold):
-        """Group nearby price levels"""
-        if len(levels) == 0:
-            return []
-            
-        grouped = []
-        current_group = [levels.iloc[0]]
-        
-        for price in levels.iloc[1:]:
-            if abs(price - current_group[-1]) / current_group[-1] <= threshold:
-                current_group.append(price)
-            else:
-                grouped.append(sum(current_group) / len(current_group))
-                current_group = [price]
-                
-        if current_group:
-            grouped.append(sum(current_group) / len(current_group))
-            
-        return grouped
-        
-    def analyze_market_context(self):
-        """Analyze market context and regime"""
-        if len(self.data) < self.atr_period:
-            return "UNKNOWN"
-            
-        # Calculate volatility
-        atr = self.calculate_atr(self.data, self.atr_period)
-        price_range = self.data['high'].max() - self.data['low'].min()
-        volatility_ratio = atr.iloc[-1] / price_range
-        
-        # Determine market regime
-        if volatility_ratio > self.volatility_threshold:
-            return "TRENDING"
-        else:
-            return "RANGING"
-            
-    def update_data(self, tick_data):
-        """Update strategy data with new tick"""
-        try:
-            # Convert tick to DataFrame row
-            tick_df = pd.DataFrame([{
-                'timestamp': datetime.fromtimestamp(int(tick_data['exchange_timestamp']) / 1000),
-                'ltp': float(tick_data['last_traded_price']) / 100,
-                'high': float(tick_data['high_price_of_the_day']) / 100,
-                'low': float(tick_data['low_price_of_the_day']) / 100,
-                'close': float(tick_data['closed_price']) / 100,
-                'volume': tick_data['volume_trade_for_the_day'],
-                'oi': tick_data['open_interest'],
-                'oi_change': tick_data.get('open_interest_change_percentage', 0),
-                'best_bid': float(tick_data['best_5_buy_data'][0]['price']) / 100 if tick_data.get('best_5_buy_data') else None,
-                'best_ask': float(tick_data['best_5_sell_data'][0]['price']) / 100 if tick_data.get('best_5_sell_data') else None,
-                'total_buy_qty': tick_data['total_buy_quantity'],
-                'total_sell_qty': tick_data['total_sell_quantity']
-            }])
-            
-            # Append to existing data
-            self.data = pd.concat([self.data, tick_df], ignore_index=True)
-            
-            # Keep only last 100 candles
-            if len(self.data) > 100:
-                self.data = self.data.tail(100)
-                
-            # Calculate indicators
-            if len(self.data) >= self.slow_ema_period:
-                # EMAs
-                self.data['fast_ema'] = self.data['ltp'].ewm(span=self.fast_ema_period, adjust=False).mean()
-                self.data['slow_ema'] = self.data['ltp'].ewm(span=self.slow_ema_period, adjust=False).mean()
-                
-                # RSI
-                self.data['rsi'] = self.calculate_rsi(self.data, self.rsi_period)
-                
-                # Volume and OI
-                self.data['volume_ma'] = self.calculate_volume_ma(self.data, self.volume_ma_period)
-                self.data['oi_ma'] = self.calculate_oi_ma(self.data, self.oi_ma_period)
-                
-                # VWAP
-                self.data['vwap'] = self.calculate_vwap(self.data)
-                
-                # Market Context
-                self.market_regime = self.analyze_market_context()
-                self.find_support_resistance(self.data)
-                
-                # Generate signals
-                self.generate_signals()
-                
-        except Exception as e:
-            logging.error(f"Error in update_data: {str(e)}")
-            logging.error(f"Traceback: {traceback.format_exc()}")
-    
-    def generate_signals(self):
-        """Generate trading signals based on multiple indicators"""
-        # Only proceed if enough data for slow EMA
-        if len(self.data) < self.slow_ema_period:
-            return pd.DataFrame()  # Not enough data for EMAs
-
-        # Calculate EMAs
-        self.data['fast_ema'] = self.data['ltp'].ewm(span=self.fast_ema_period, adjust=False).mean()
-        self.data['slow_ema'] = self.data['ltp'].ewm(span=self.slow_ema_period, adjust=False).mean()
-        
-        # Calculate RSI
-        self.data['rsi'] = self.calculate_rsi(self.data, self.rsi_period)
-        
-        # Calculate Volume and OI MAs
-        self.data['volume_ma'] = self.calculate_volume_ma(self.data, self.volume_ma_period)
-        self.data['oi_ma'] = self.calculate_oi_ma(self.data, self.oi_ma_period)
-        
-        # Calculate VWAP
-        self.data['vwap'] = self.calculate_vwap(self.data)
-        
-        # Initialize signal columns
-        self.data['final_signal'] = 0
-        self.data['rsi_signal'] = 0
-        self.data['macd_signal'] = 0
-        self.data['bb_signal'] = 0
-        self.data['volume_signal'] = 0
-        self.data['oi_signal'] = 0
-        self.data['iv_signal'] = 0
-        self.data['greeks_signal'] = 0
-        
-        # Get current and previous values
-        current_fast = self.data['fast_ema'].iloc[-1]
-        current_slow = self.data['slow_ema'].iloc[-1]
-        prev_fast = self.data['fast_ema'].iloc[-2]
-        prev_slow = self.data['slow_ema'].iloc[-2]
-        
-        # Get latest values for other indicators
-        current_rsi = self.data['rsi'].iloc[-1]
-        current_volume = self.data['volume'].iloc[-1]
-        current_volume_ma = self.data['volume_ma'].iloc[-1]
-        current_oi = self.data['oi'].iloc[-1]
-        current_oi_ma = self.data['oi_ma'].iloc[-1]
-        current_price = self.data['ltp'].iloc[-1]
-        current_vwap = self.data['vwap'].iloc[-1]
-        
-        # Check for buy signal
-        if (prev_fast <= prev_slow and current_fast > current_slow and  # EMA crossover
-            current_rsi < 70 and  # Not overbought
-            current_volume > current_volume_ma * self.min_volume_increase and  # Volume confirmation
-            current_oi > current_oi_ma * self.min_oi_increase and  # OI confirmation
-            current_price > current_vwap and  # Price above VWAP
-            self.is_near_support(current_price)):  # Near support level
-            
-            self.data.loc[self.data.index[-1], 'final_signal'] = 1  # Buy signal
-            self.data.loc[self.data.index[-1], 'rsi_signal'] = 1
-            self.data.loc[self.data.index[-1], 'macd_signal'] = 1
-            self.data.loc[self.data.index[-1], 'volume_signal'] = 1
-            self.data.loc[self.data.index[-1], 'oi_signal'] = 1
-            
-        # Check for sell signal
-        elif (prev_fast >= prev_slow and current_fast < current_slow and  # EMA crossover
-              current_rsi > 30 and  # Not oversold
-              current_volume > current_volume_ma * self.min_volume_increase and  # Volume confirmation
-              current_oi > current_oi_ma * self.min_oi_increase and  # OI confirmation
-              current_price < current_vwap and  # Price below VWAP
-              self.is_near_resistance(current_price)):  # Near resistance level
-            
-            self.data.loc[self.data.index[-1], 'final_signal'] = -1  # Sell signal
-            self.data.loc[self.data.index[-1], 'rsi_signal'] = -1
-            self.data.loc[self.data.index[-1], 'macd_signal'] = -1
-            self.data.loc[self.data.index[-1], 'volume_signal'] = 1
-            self.data.loc[self.data.index[-1], 'oi_signal'] = 1
-            
-        return self.data
-    
-    def is_near_support(self, price, threshold=0.01):
-        """Check if price is near support level"""
-        for level in self.support_levels:
-            if abs(price - level) / level <= threshold:
-                return True
-        return False
-        
-    def is_near_resistance(self, price, threshold=0.01):
-        """Check if price is near resistance level"""
-        for level in self.resistance_levels:
-            if abs(price - level) / level <= threshold:
-                return True
-        return False
-        
-    def should_exit_trade(self, current_price, entry_price):
-        """Determine if we should exit the trade"""
-        if not self.current_trade:
-            return False, None
-            
-        # Calculate profit percentage
-        profit_pct = (current_price - entry_price) / entry_price
-        
-        # Check for partial exit
-        if (profit_pct >= self.partial_exit_target and 
-            not self.current_trade.get('partial_exit_taken', False)):
-            return True, "PARTIAL_EXIT"
-            
-        # Check for trailing stop loss
-        if self.current_trade.get('trailing_sl_activated', False):
-            if current_price <= self.current_trade['trailing_sl']:
-                return True, "TRAILING_SL"
-                
-        # Check for stop loss
-        if current_price <= self.current_trade['stop_loss']:
-            return True, "STOP_LOSS"
-            
-        # Check for target
-        if current_price >= self.current_trade['target']:
-            return True, "TARGET"
-            
-        return False, None
-        
-    def process_tick_with_trading(self, tick_data):
-        """Process tick data and execute trades"""
-        try:
-            # Get current time from tick data
-            if 'exchange_timestamp' in tick_data:
-                current_time = datetime.fromtimestamp(int(tick_data['exchange_timestamp']) / 1000).time()
-            else:
-                current_time = datetime.now().time()
-            
-            # Update strategy data
-            self.update_data(tick_data)
-            
-            # Check if we can trade
-            can_trade, signal_type = self.can_trade(current_time)
-            
-            if can_trade:
-                if signal_type == "ENTRY":
-                    # Get latest signal
-                    latest_signal = self.data['signal'].iloc[-1]
-                    
-                    # Determine option type based on signal
-                    option_type = 'CE' if latest_signal == 1 else 'PE'
-                    
-                    # Get ATM strike
-                    atm_strike = self.contract_hub.get_atm_strike()
-                    if not atm_strike:
-                        return
-                        
-                    # Get contract details
-                    contract = self.contract_hub.get_contract(atm_strike, option_type)
-                    if not contract:
-                        return
-                        
-                    # Calculate entry price, stop loss and target
-                    entry_price = tick_data['ltp']
-                    stop_loss = entry_price * 0.75  # 25% stop loss
-                    target = entry_price * 1.40     # 40% target
-                    
-                    # Calculate position size
-                    position_size = self.calculate_position_size(entry_price, stop_loss, option_type)
-                    
-                    # Update trade state
-                    self.trade_state = 'IN_TRADE'
-                    self.current_trade = {
-                        'entry_price': entry_price,
-                        'stop_loss': stop_loss,
-                        'target': target,
-                        'position_size': position_size,
-                        'option_type': option_type,
-                        'entry_time': current_time,
-                        'trailing_sl_activated': False,
-                        'partial_exit_taken': False
-                    }
-                    self.trades_today += 1
-                    
-                    logging.info(f"Entered {option_type} trade at {entry_price}")
-                    
-                elif signal_type == "EXIT" and self.trade_state == 'IN_TRADE':
-                    # Calculate PnL
-                    exit_price = tick_data['ltp']
-                    pnl = (exit_price - self.current_trade['entry_price']) * self.current_trade['position_size']
-                    self.daily_pnl += pnl
-                    
-                    # Reset trade state
-                    self.trade_state = 'IDLE'
-                    self.current_trade = None
-                    
-                    logging.info(f"Exited trade at {exit_price}, PnL: {pnl}")
-                    
-            # Check for exits if in trade
-            elif self.trade_state == 'IN_TRADE':
-                current_price = tick_data['ltp']
-                should_exit, exit_reason = self.should_exit_trade(current_price, self.current_trade['entry_price'])
-                
-                if should_exit:
-                    if exit_reason == "PARTIAL_EXIT":
-                        # Exit 50% of position
-                        exit_size = self.current_trade['position_size'] * self.partial_exit_percentage
-                        pnl = (current_price - self.current_trade['entry_price']) * exit_size
-                        self.daily_pnl += pnl
-                        self.current_trade['position_size'] -= exit_size
-                        self.current_trade['partial_exit_taken'] = True
-                        logging.info(f"Partial exit at {current_price}, PnL: {pnl}")
-                        
-                    else:
-                        # Full exit
-                        pnl = (current_price - self.current_trade['entry_price']) * self.current_trade['position_size']
-                        self.daily_pnl += pnl
-                        self.trade_state = 'IDLE'
-                        self.current_trade = None
-                        logging.info(f"Exited trade at {current_price} due to {exit_reason}, PnL: {pnl}")
-                        
-                # Update trailing stop loss if activated
-                elif self.current_trade.get('trailing_sl_activated', False):
-                    new_sl = current_price * (1 - self.trailing_sl_distance)
-                    if new_sl > self.current_trade['trailing_sl']:
-                        self.current_trade['trailing_sl'] = new_sl
-                        logging.info(f"Updated trailing stop loss to {new_sl}")
-                        
-                # Check for trailing stop loss activation
-                elif not self.current_trade.get('trailing_sl_activated', False):
-                    profit_pct = (current_price - self.current_trade['entry_price']) / self.current_trade['entry_price']
-                    if profit_pct >= self.trailing_sl_percentage:
-                        self.current_trade['trailing_sl_activated'] = True
-                        self.current_trade['trailing_sl'] = current_price * (1 - self.trailing_sl_distance)
-                        logging.info(f"Activated trailing stop loss at {current_price}")
-                        
-        except Exception as e:
-            logging.error(f"Error in process_tick_with_trading: {str(e)}")
-            logging.error(f"Full error details: {traceback.format_exc()}")
-
-class Trade:
-    def __init__(self, symbol, strike, option_type, entry_price, quantity, entry_time):
-        self.symbol = symbol
-        self.strike = strike
-        self.option_type = option_type  # 'CE' or 'PE'
-        self.entry_price = entry_price
-        self.quantity = quantity
-        self.entry_time = entry_time
-        self.exit_price = None
-        self.exit_time = None
-        self.pnl = 0
-        self.status = "OPEN"
-        self.exit_reason = None
-
-    def close(self, exit_price, exit_time, reason="Manual Exit"):
-        self.exit_price = exit_price
-        self.exit_time = exit_time
-        self.pnl = (exit_price - self.entry_price) * self.quantity if self.option_type == 'CE' else (self.entry_price - exit_price) * self.quantity
-        self.status = "CLOSED"
-        self.exit_reason = reason
-
-def calculate_greeks(S, K, T, r, sigma, option_type='call'):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if option_type == 'call':
-        delta = norm.cdf(d1)
-        theta = (-S * sigma * norm.pdf(d1)) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        delta = -norm.cdf(-d1)
-        theta = (-S * sigma * norm.pdf(d1)) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    vega = S * np.sqrt(T) * norm.pdf(d1)
-    rho = K * T * np.exp(-r * T) * (norm.cdf(d2) if option_type == 'call' else -norm.cdf(-d2))
-    return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega, 'rho': rho}
-
-def enter_trade(symbol, strike, option_type, entry_price, quantity, entry_time):
-    trade = Trade(symbol, strike, option_type, entry_price, quantity, entry_time)
-    paper_trades.append(trade)
-    return trade
-
-def exit_trade(trade, exit_price, exit_time, reason="Manual Exit"):
-    trade.close(exit_price, exit_time, reason)
-
-def export_trades_to_csv(filename="trades.csv"):
-    with open(filename, "w", newline="") as csvfile:
-        fieldnames = ["symbol", "strike", "option_type", "entry_price", "quantity", "entry_time", "exit_price", "exit_time", "pnl", "status", "exit_reason"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for trade in paper_trades:
-            writer.writerow(trade.__dict__)
-
-def get_total_pnl():
-    return sum(t.pnl for t in paper_trades if t.status == "CLOSED")
-
-def get_win_rate():
-    closed = [t for t in paper_trades if t.status == "CLOSED"]
-    wins = [t for t in closed if t.pnl > 0]
-    return (len(wins) / len(closed) * 100) if closed else 0
-
-def get_available_instruments():
-    """Get list of available trading instruments"""
-    return list(map_dict.keys())
-
-def set_global_smartapi(api_obj):
-    """Set the global smartapi_obj variable from an external module"""
-    global smartapi_obj
-    smartapi_obj = api_obj
-    logging.info("Global SmartAPI object has been set from external source")
-    return True
-
 if __name__ == "__main__":
-    print("Starting AlgoTrade application...")
+    print("=== AlgoTrade is starting (DEBUG) ===")
     logger = setup_logging()
-    logging.info("Logging initialized")
-    
+    logging.info("Logging initialized (DEBUG)")
     try:
+        # Version check for smartapi-python
+        try:
+            smartapi_version = pkg_resources.get_distribution("smartapi-python").version
+            print(f"smartapi-python version: {smartapi_version}")
+        except Exception as e:
+            print(f"Could not determine smartapi-python version: {e}")
         print("Attempting to login to SmartAPI...")
-        # Initialize SmartAPI with retry
         smartapi_obj, session_data = login_to_smartapi()
         logging.info("SmartAPI login successful")
-        
-        # Get feed token
         print("Getting feed token...")
         feed_token = session_data['data']['feedToken']
         if not feed_token:
             raise Exception("Could not get feed token")
         logging.info("Successfully retrieved feed token")
-        
-        # Process contracts with retry
         print("Processing contracts...")
         contract_hub_exchng = preprocess_contract_hub_exchange()
-        logging.info("Contract processing completed")
-        
-        # Let user select the instrument
+        print("Contract preprocessing complete (DEBUG)")
+        logging.info("Contract processing completed (DEBUG)")
         print("Selecting trading instrument...")
         selected_instrument = select_trading_instrument()
         logging.info(f"Selected instrument: {selected_instrument}")
-        
-        # Get expiry dates for selected instrument
         print("Getting expiry dates...")
         expiry_info, tokens = get_recent_expiry(selected_instrument)
         if not expiry_info or not tokens:
             raise Exception(f"Could not get expiry info for {selected_instrument}")
-            
         all_expiries = {map_dict[selected_instrument]['NAME']: expiry_info[map_dict[selected_instrument]['NAME']]}
         logging.info(f"Expiry info: {all_expiries}")
-        
-        # Get first expiry date
         instrument_expiry = all_expiries[map_dict[selected_instrument]['NAME']][0]
         logging.info(f"Selected expiry: {instrument_expiry}")
-        
-        # For MCX instruments
         if map_dict[selected_instrument]['SEGMENT'] == 'MCX':
             print("Processing MCX instrument...")
             expiry_key = f"{selected_instrument}_{instrument_expiry}"
             if expiry_key in exchange_token_hub and "FUT" in exchange_token_hub[expiry_key]:
                 selected_token = exchange_token_hub[expiry_key]["FUT"][0]
                 logging.info(f"Found MCX token for {selected_instrument}: {selected_token}")
-                
-                # Print expiry and symbol in terminal for the MCX token
                 symbol_details = get_symbol_details(selected_token)
                 if symbol_details:
                     print(f"Selected MCX Token: {selected_token}")
@@ -1511,60 +947,43 @@ if __name__ == "__main__":
                     print(f"Selected MCX Token: {selected_token}")
                     print("Symbol details not found.")
                     print(f"Expiry: {instrument_expiry}")
-                
-                # Initialize token list for MCX
-                token_list = [{
-                    "exchangeType": 5,  # MCX exchange type
-                    "tokens": [selected_token]
-                }]
+                token_list = [{"exchangeType": 5, "tokens": [selected_token]}]
             else:
                 raise Exception(f"No futures tokens found for {selected_instrument} expiry {instrument_expiry}")
         else:
             print("Processing options instrument...")
-            # For options instruments, get ATM strike and CE token
             current_price = get_ltp(selected_instrument)
             if not current_price:
                 raise Exception(f"Could not get current price for {selected_instrument}")
             logging.info(f"Current price for {selected_instrument}: {current_price}")
-            
             atm_strike = get_atm_strike(selected_instrument, current_price, instrument_expiry)
             if not atm_strike:
                 raise Exception(f"Could not get ATM strike for {selected_instrument}")
             logging.info(f"ATM strike: {atm_strike}")
-            
             tokens_dict = exchange_token_hub[f"{selected_instrument}_{instrument_expiry}"]
             if not tokens_dict:
                 raise Exception(f"No tokens found for {selected_instrument} expiry {instrument_expiry}")
-            
-            # Get all CE and PE symbols with their tokens
-            ce_symbols = {get_symbol_details(t)['symbol']: t for t in tokens_dict["CE"] if get_symbol_details(t)}
-            pe_symbols = {get_symbol_details(t)['symbol']: t for t in tokens_dict["PE"] if get_symbol_details(t)}
-            
-            # Get all available strikes for this expiry
-            expiry_contracts = df[df['expiry'] == instrument_expiry]
+            expiry_contracts = df[
+                (df['expiry'].dt.strftime('%Y-%m-%d') == instrument_expiry) &
+                (df['name'] == map_dict[selected_instrument]['NAME']) &
+                (df['exch_seg'] == map_dict[selected_instrument]['SEGMENT']) &
+                (df['instrumenttype'] == 'OPTIDX')
+            ].copy()
             if expiry_contracts.empty:
-                raise Exception(f"No contracts found for expiry {instrument_expiry}")
-                
-            all_strikes = sorted(expiry_contracts['strike'].unique())
-            logging.info(f"Available strikes: {all_strikes[:10]}")  # Show first 10 strikes
-            
-            # Find ATM strike (nearest to spot price)
-            # Convert spot price to match strike format (multiply by 100)
-            spot_price_100 = current_price * 100
-            atm_strike = min(all_strikes, key=lambda x: abs(float(x) - spot_price_100))
+                raise Exception(f"No contracts found for {selected_instrument} expiry {instrument_expiry}")
+            all_strikes = sorted([s for s in expiry_contracts['strike'].unique() if s > 0])
+            if not all_strikes:
+                raise Exception(f"No valid strikes found for {selected_instrument} expiry {instrument_expiry}")
+            logging.info(f"Available strikes: {all_strikes[:10]}")
+            atm_strike = min(all_strikes, key=lambda x: abs(x - current_price))
             logging.info(f"ATM Strike selected: {atm_strike}")
-            
-            # Initialize monitoring for ATM strikes only
             token_list = []
             monitored_contracts = []
-            
-            # Monitor only ATM strikes for both CE and PE
             for option_type in ["CE", "PE"]:
                 contract = expiry_contracts[
-                    (expiry_contracts['strike'] == atm_strike) & 
+                    (expiry_contracts['strike'] == atm_strike) &
                     (expiry_contracts['symbol'].str.endswith(option_type))
                 ]
-                
                 if not contract.empty:
                     contract_data = contract.iloc[0]
                     contract_details = {
@@ -1572,60 +991,43 @@ if __name__ == "__main__":
                         'tradingsymbol': contract_data['symbol'],
                         'lot_size': int(contract_data['lotsize']),
                         'tick_size': float(contract_data['tick_size']),
-                        'strike': float(atm_strike)/100,  # Convert back to normal price
+                        'strike': float(atm_strike),
                         'expiry': instrument_expiry
                     }
                     token_list.append(contract_details['token'])
                     monitored_contracts.append(contract_details)
                     logging.info(f"Monitoring {contract_details['tradingsymbol']} (ATM) - Token: {contract_details['token']}")
                     initialize_trade_state(contract_details['token'], contract_details['tradingsymbol'], entry_threshold=float('inf'))
-            
             if not token_list:
                 raise Exception("No valid tokens found for monitoring")
-            
-            # Initialize WebSocket with selected tokens
-            ws_token_list = [{
-                "action": 1,
-                "exchangeType": 2,
-                "tokens": token_list
-            }]
-            
-            # Send startup notification using new notifier
+            ws_token_list = [{"action": 1, "exchangeType": 2, "tokens": token_list}]
             monitored_symbols = [contract['tradingsymbol'] for contract in monitored_contracts]
             telegram_notifier.notify_startup(
                 instrument=selected_instrument,
                 expiry=instrument_expiry,
                 spot_price=current_price,
-                atm_strike=float(atm_strike)/100,
+                atm_strike=float(atm_strike),
                 monitored=monitored_symbols,
                 strategy="High Win-Rate Strategy"
             )
-        
         print("Creating WebSocket instance...")
-        # Create WebSocket instance
         websocket = SmartAPIWebSocket(
             session_data,
             API_KEY,
             CLIENT_CODE,
             ws_token_list
         )
+        # Print the WebSocket endpoint if available
+        print(f"WebSocket endpoint: {getattr(websocket.sws, 'url', 'unknown')}")
         websocket.smartapi_obj = smartapi_obj
-        
-        # Initialize trade states for tokens
         if map_dict[selected_instrument]['SEGMENT'] == 'MCX':
-            # For MCX, just initialize the futures token
             initialize_trade_state(selected_token, symbol_details.get('symbol', 'N/A'), 0.5)
         else:
-            # For options, initialize both CE and PE tokens
             for contract in monitored_contracts:
                 initialize_trade_state(contract['token'], contract['tradingsymbol'], 0.5)
-        
         print("Starting WebSocket connection...")
-        # Start WebSocket in a separate thread
         websocket.start()
-        
         print("Application started successfully. Press Ctrl+C to exit.")
-        # Keep the main thread running with heartbeat check
         try:
             while True:
                 time.sleep(1)
@@ -1637,7 +1039,6 @@ if __name__ == "__main__":
             )
             logging.info("Application terminated by user")
             sys.exit(0)
-            
     except Exception as e:
         logging.error(f"Application error: {str(e)}")
         logging.error(f"Traceback: {traceback.format_exc()}")
@@ -1646,3 +1047,57 @@ if __name__ == "__main__":
             message=f"Trading Bot Error: {str(e)}"
         )
         sys.exit(1)
+
+# Instantiate analytics engine
+analytics = TradingAnalytics(db_path="trading_analytics.db")
+
+# === ANALYTICS LOGGING TEMPLATES ===
+# Use these templates at the point where you enter or exit a trade.
+# Example: After placing an order and updating trade_state, call analytics.record_trade() as shown below.
+
+# --- Trade Entry Example ---
+# analytics.record_trade({
+#     'symbol': symbol,  # e.g., 'NIFTY24JUN18000CE'
+#     'entry_time': entry_time,  # datetime object or string
+#     'entry_price': entry_price,  # float
+#     'quantity': quantity,  # int
+#     'direction': direction,  # 'BUY' or 'SELL'
+#     'status': 'OPEN',
+#     'strategy': STRATEGY_NAME,
+#     'stop_loss': stop_loss,  # float
+#     'target_price': target_price,  # float
+#     'exit_reason': None
+# })
+
+# --- Trade Exit Example ---
+# analytics.record_trade({
+#     'symbol': symbol,
+#     'entry_time': entry_time,
+#     'exit_time': exit_time,  # datetime object or string
+#     'entry_price': entry_price,
+#     'exit_price': exit_price,  # float
+#     'quantity': quantity,
+#     'direction': direction,
+#     'pnl': pnl,  # float
+#     'status': 'CLOSED',
+#     'strategy': STRATEGY_NAME,
+#     'stop_loss': stop_loss,
+#     'target_price': target_price,
+#     'exit_reason': exit_reason  # e.g., 'TARGET', 'STOP_LOSS', 'MANUAL', etc.
+# })
+
+# === REPORT GENERATION AT SHUTDOWN ===
+# This should be called before sys.exit(0) or sys.exit(1) in the main block.
+def generate_and_save_report():
+    try:
+        os.makedirs('reports', exist_ok=True)
+        report_html = analytics.generate_performance_report()
+        analytics.save_report(report_html, filename=f"reports/performance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+        logging.info("Performance report generated and saved.")
+    except Exception as e:
+        logging.error(f"Failed to generate/save performance report: {str(e)}")
+
+# ... existing code ...
+# In the main block, before sys.exit(0) or sys.exit(1):
+# generate_and_save_report()
+# ... existing code ...

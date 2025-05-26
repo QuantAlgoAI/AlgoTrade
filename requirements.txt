@@ -1,27 +1,58 @@
 # Core dependencies
-pandas==2.1.4
-numpy==1.26.2
-python-dotenv==1.0.0
+pandas
+numpy
+python-dotenv
 
 # Trading and data
-smartapi-python==1.3.5
-ta-lib==0.6.3
-yfinance==0.2.56
+smartapi-python
+ta-lib
+yfinance
 
 # Web framework
-flask==3.0.0
-flask-sqlalchemy==3.1.1
-flask-migrate==4.0.5
+flask
+flask-sqlalchemy
+flask-migrate
+flask-socketio
 
 # Analytics and visualization
-plotly==5.18.0
-kaleido==0.2.1  # For static image export
+plotly
+kaleido
 
 # Utilities
-python-dateutil==2.8.2
-pytz==2023.3
-requests==2.31.0
-websocket-client==1.7.0
-matplotlib==3.8.2
-seaborn==0.13.0
+python-dateutil
+pytz
+requests
+websocket-client
+matplotlib
+seaborn
+
+# Machine learning and advanced analytics
+scikit-learn
+joblib
+ta
+
+# Testing and code quality
+pytest
+pytest-cov
+flake8
+black
+isort
+bandit
+safety
+
+# Docker
+docker
+docker-compose
+
+# WebSocket
+websocket-client    
+
+# Logging
+logzero
+
+# Cryptography
+pycryptodome
+
+# Telegram
+python-telegram-bot
 

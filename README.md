@@ -137,4 +137,31 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - yfinance for market data
 - SmartAPI for trading integration
 - Flask for web interface
-- Plotly for visualizations 
+- Plotly for visualizations
+
+## Production Deployment
+
+### Security
+- Ensure `.env` and all secrets are excluded from version control (see `.gitignore`).
+- Use strong, unique passwords for all users and the database.
+- If exposing the app to the internet, use HTTPS (see Nginx or Caddy docs).
+
+### Database Backups
+- Use the provided `backup_postgres.sh` script to back up your PostgreSQL database:
+  ```sh
+  bash backup_postgres.sh
+  ```
+- Backups are saved in the `backups/` directory with a timestamp.
+- Test restoring from backup regularly.
+
+### Resource Limits
+- Docker Compose now sets memory and CPU limits for both the app and database.
+- Adjust `mem_limit` and `cpus` in `docker-compose.yml` as needed for your server.
+
+### Monitoring & Recovery
+- Review logs in the `logs/` directory.
+- Use Docker healthchecks and restart policies for resilience.
+
+### Further Hardening
+- Set up a reverse proxy (Nginx, Caddy) for HTTPS and load balancing.
+- Add monitoring/alerting for critical errors and resource usage. 

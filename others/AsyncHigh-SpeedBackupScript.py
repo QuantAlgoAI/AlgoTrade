@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SOURCE_DIR = os.getenv("SOURCE_DIR", os.path.dirname(os.path.abspath(__file__)))
-BACKUP_BASE_DIR = os.getenv("BACKUP_BASE_DIR", r"D:\Backup\MS")
+BACKUP_BASE_DIR = os.getenv("BACKUP_BASE_DIR", r"D:\Backup\MS_001")
 
 EXCLUDED_EXTENSIONS = {'.pyc', '.log'}
 EXCLUDED_DIRS = {'__pycache__', '.git'}

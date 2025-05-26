@@ -8,170 +8,152 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 from typing import Dict, List, Optional, Union
-import sqlite3
-from config import Config
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, func
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import IntegrityError
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Import Flask app and db/models
+from models import db, Trade
+from flask import current_app
+from flask import Flask
+
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+load_dotenv()
+
+Base = declarative_base()
+
+# ORM Models
+class Trade(Base):
+    __tablename__ = 'trades'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(50), nullable=False)
+    entry_time = Column(DateTime, nullable=False)
+    exit_time = Column(DateTime)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float)
+    quantity = Column(Integer, nullable=False)
+    direction = Column(String(10), nullable=False)
+    pnl = Column(Float)
+    status = Column(String(20), nullable=False)
+    strategy = Column(String(50), nullable=False)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    exit_reason = Column(String(100))
+
+class PerformanceMetrics(Base):
+    __tablename__ = 'performance_metrics'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, nullable=False)
+    total_trades = Column(Integer)
+    winning_trades = Column(Integer)
+    losing_trades = Column(Integer)
+    win_rate = Column(Float)
+    avg_profit = Column(Float)
+    avg_loss = Column(Float)
+    profit_factor = Column(Float)
+    max_drawdown = Column(Float)
+    sharpe_ratio = Column(Float)
+    daily_pnl = Column(Float)
+
+# Helper to get DB URL from .env
+DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME', 'quantalgo_db')
+DB_TYPE = os.getenv('DB_TYPE', 'postgresql')
+
+if DB_TYPE == 'sqlite':
+    DB_URL = f"sqlite:///trading_analytics.db"
+else:
+    DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+engine = create_engine(DB_URL, echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine)
+
+# Ensure tables exist
+Base.metadata.create_all(engine)
+
+# If running standalone, create app and push context
+def get_app_context():
+    try:
+        app = current_app
+    except RuntimeError:
+        app = Flask(__name__)
+        app.config.from_pyfile('config.py', silent=True)
+        db.init_app(app)
+        app.app_context().push()
+    return app
+
 class TradingAnalytics:
-    """Analytics engine for trading performance monitoring and analysis."""
-    
-    def __init__(self, db_path: str = "trading_analytics.db"):
-        """Initialize analytics engine.
-        
-        Args:
-            db_path: Path to SQLite database for storing analytics data
-        """
-        self.db_path = db_path
-        self._init_db()
-        
-    def _init_db(self):
-        """Initialize SQLite database with required tables."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            # Create trades table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    entry_time TIMESTAMP NOT NULL,
-                    exit_time TIMESTAMP,
-                    entry_price REAL NOT NULL,
-                    exit_price REAL,
-                    quantity INTEGER NOT NULL,
-                    direction TEXT NOT NULL,
-                    pnl REAL,
-                    status TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    stop_loss REAL,
-                    target_price REAL,
-                    exit_reason TEXT
-                )
-            """)
-            
-            # Create performance metrics table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS performance_metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TIMESTAMP NOT NULL,
-                    total_trades INTEGER,
-                    winning_trades INTEGER,
-                    losing_trades INTEGER,
-                    win_rate REAL,
-                    avg_profit REAL,
-                    avg_loss REAL,
-                    profit_factor REAL,
-                    max_drawdown REAL,
-                    sharpe_ratio REAL,
-                    daily_pnl REAL
-                )
-            """)
-            
-            conn.commit()
+    """Analytics engine for trading performance monitoring and analysis (Flask-SQLAlchemy unified)."""
+    def __init__(self):
+        get_app_context()  # Ensure app context for db.session
     
     def record_trade(self, trade_data: Dict):
-        """Record a trade in the database.
-        
-        Args:
-            trade_data: Dictionary containing trade information
-        """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Log the trade data being recorded
-                logger.debug(f"Recording trade data: {json.dumps(trade_data, default=str)}")
-                
-                # Check if trade already exists
-                cursor.execute("""
-                    SELECT id FROM trades 
-                    WHERE symbol = ? AND entry_time = ? AND entry_price = ?
-                """, (
-                    trade_data['symbol'],
-                    trade_data['entry_time'],
-                    trade_data['entry_price']
-                ))
-                
-                existing_trade = cursor.fetchone()
-                if existing_trade:
-                    logger.warning(f"Trade already exists with ID: {existing_trade[0]}")
+            # Check if trade already exists (by symbol, entry_time, entry_price)
+            exists = Trade.query.filter_by(
+                symbol=trade_data['symbol'],
+                entry_time=trade_data['entry_time'],
+                entry_price=trade_data['entry_price']
+            ).first()
+            if exists:
+                logger.warning(f"Trade already exists with ID: {exists.id}")
                     return
-                
-                # Insert new trade
-                cursor.execute("""
-                    INSERT INTO trades (
-                        symbol, entry_time, exit_time, entry_price, exit_price,
-                        quantity, direction, pnl, status, strategy,
-                        stop_loss, target_price, exit_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    trade_data['symbol'],
-                    trade_data['entry_time'],
-                    trade_data.get('exit_time'),
-                    trade_data['entry_price'],
-                    trade_data.get('exit_price'),
-                    trade_data['quantity'],
-                    trade_data['direction'],
-                    trade_data.get('pnl'),
-                    trade_data['status'],
-                    trade_data['strategy'],
-                    trade_data.get('stop_loss'),
-                    trade_data.get('target_price'),
-                    trade_data.get('exit_reason')
-                ))
-                
-                # Get the ID of the inserted trade
-                trade_id = cursor.lastrowid
-                conn.commit()
-                
-                logger.debug(f"Successfully recorded trade {trade_id}: {trade_data['symbol']} at {trade_data['entry_time']}")
-                
+            trade = Trade(
+                symbol=trade_data['symbol'],
+                entry_time=trade_data['entry_time'],
+                exit_time=trade_data.get('exit_time'),
+                entry_price=trade_data['entry_price'],
+                exit_price=trade_data.get('exit_price'),
+                quantity=trade_data['quantity'],
+                direction=trade_data['direction'],
+                pnl=trade_data.get('pnl'),
+                status=trade_data['status'],
+                strategy=trade_data['strategy'],
+                stop_loss=trade_data.get('stop_loss'),
+                target_price=trade_data.get('target_price'),
+                exit_reason=trade_data.get('exit_reason'),
+                # Add other fields as needed
+            )
+            db.session.add(trade)
+            db.session.commit()
+            logger.debug(f"Successfully recorded trade {trade.id}: {trade.symbol} at {trade.entry_time}")
         except Exception as e:
+            db.session.rollback()
             logger.error(f"Error recording trade: {str(e)}")
             logger.error(f"Trade data: {json.dumps(trade_data, default=str)}")
             raise
     
     def update_trade(self, trade_id: int, update_data: Dict):
-        """Update an existing trade record.
-        
-        Args:
-            trade_id: ID of the trade to update
-            update_data: Dictionary containing updated trade information
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            set_clause = ", ".join(f"{k} = ?" for k in update_data.keys())
-            cursor.execute(f"""
-                UPDATE trades
-                SET {set_clause}
-                WHERE id = ?
-            """, (*update_data.values(), trade_id))
-            conn.commit()
+        try:
+            trade = Trade.query.filter_by(id=trade_id).first()
+            if not trade:
+                logger.warning(f"Trade with ID {trade_id} not found.")
+                return
+            for k, v in update_data.items():
+                setattr(trade, k, v)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error updating trade: {str(e)}")
+            raise
     
     def calculate_performance_metrics(self, start_date: Optional[datetime] = None) -> Dict:
-        """Calculate performance metrics for all trades.
-        
-        Args:
-            start_date: Optional start date to filter trades from
-            
-        Returns:
-            Dictionary containing performance metrics
-        """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Get all trades
-                query = """
-                    SELECT * FROM trades 
-                    ORDER BY entry_time
-                """
-                df = pd.read_sql_query(query, conn)
-                
-                logger.debug(f"Total trades in database: {len(df)}")
-                
-                if len(df) == 0:
+            query = Trade.query
+            if start_date:
+                query = query.filter(Trade.entry_time >= start_date)
+            trades = pd.read_sql(query.statement, db.session.bind)
+            logger.debug(f"Total trades in database: {len(trades)}")
+            if len(trades) == 0:
                     return {
                         'total_trades': 0,
                         'winning_trades': 0,
@@ -184,48 +166,24 @@ class TradingAnalytics:
                         'sharpe_ratio': 0.0,
                         'daily_pnl': 0.0
                     }
-                
-                # Convert entry_time to datetime
-                df['entry_time'] = pd.to_datetime(df['entry_time'])
-                
-                # Filter by start date if provided
-                if start_date:
-                    df = df[df['entry_time'] >= start_date]
-                
-                logger.debug(f"Total trades after filtering: {len(df)}")
-                
-                # Calculate metrics
-                winning_trades = df[df['pnl'] > 0]
-                losing_trades = df[df['pnl'] < 0]
-                
-                logger.debug(f"Winning trades: {len(winning_trades)}")
-                logger.debug(f"Losing trades: {len(losing_trades)}")
-                
-                total_trades = len(df)
+            trades['entry_time'] = pd.to_datetime(trades['entry_time'])
+            winning_trades = trades[trades['pnl'] > 0]
+            losing_trades = trades[trades['pnl'] < 0]
+            total_trades = len(trades)
                 win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
-                
                 avg_profit = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
                 avg_loss = abs(losing_trades['pnl'].mean()) if len(losing_trades) > 0 else 0
-                
                 total_profit = winning_trades['pnl'].sum() if len(winning_trades) > 0 else 0
                 total_loss = abs(losing_trades['pnl'].sum()) if len(losing_trades) > 0 else 0
-                
                 profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
-                
-                # Calculate daily PnL
-                df['date'] = df['entry_time'].dt.date
-                daily_pnl = df.groupby('date')['pnl'].sum().mean()
-                
-                # Calculate max drawdown
-                cumulative_pnl = df['pnl'].cumsum()
+            trades['date'] = trades['entry_time'].dt.date
+            daily_pnl = trades.groupby('date')['pnl'].sum().mean()
+            cumulative_pnl = trades['pnl'].cumsum()
                 rolling_max = cumulative_pnl.expanding().max()
                 drawdowns = (cumulative_pnl - rolling_max) / rolling_max * 100
                 max_drawdown = abs(drawdowns.min())
-                
-                # Calculate Sharpe ratio (assuming risk-free rate of 0)
-                returns = df['pnl'].pct_change().dropna()
+            returns = trades['pnl'].pct_change().dropna()
                 sharpe_ratio = np.sqrt(252) * (returns.mean() / returns.std()) if len(returns) > 0 else 0
-                
                 metrics = {
                     'total_trades': total_trades,
                     'winning_trades': len(winning_trades),
@@ -238,13 +196,10 @@ class TradingAnalytics:
                     'sharpe_ratio': sharpe_ratio,
                     'daily_pnl': daily_pnl
                 }
-                
                 logger.info("Performance metrics calculated:")
                 for key, value in metrics.items():
                     logger.info(f"{key}: {value}")
-                
                 return metrics
-                
         except Exception as e:
             logger.error(f"Error calculating performance metrics: {str(e)}")
             raise
@@ -271,7 +226,7 @@ class TradingAnalytics:
             )
         )
         
-        with sqlite3.connect(self.db_path) as conn:
+        with db.session as conn:
             trades_df = pd.read_sql_query("""
                 SELECT * FROM trades
                 WHERE entry_time >= ?
@@ -420,7 +375,7 @@ class TradingAnalytics:
         Returns:
             DataFrame containing recent trades
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with db.session as conn:
             trades_df = pd.read_sql_query("""
                 SELECT * FROM trades
                 ORDER BY entry_time DESC
@@ -442,7 +397,7 @@ class TradingAnalytics:
         Returns:
             Dictionary containing trade statistics
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with db.session as conn:
             query = """
                 SELECT 
                     symbol,
@@ -466,10 +421,9 @@ class TradingAnalytics:
     
     def cleanup(self):
         """Clear all data from the database tables."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM trades")
-            cursor.execute("DELETE FROM performance_metrics")
+        with db.session as conn:
+            conn.query("DELETE FROM trades")
+            conn.query("DELETE FROM performance_metrics")
             conn.commit()
             logger.info("Database tables cleared")
 
@@ -480,7 +434,7 @@ class TradingAnalytics:
             save_path: Optional path to save the plot
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db.session as conn:
                 df = pd.read_sql_query("SELECT * FROM trades", conn)
                 
                 # Create figure with subplots
@@ -551,7 +505,7 @@ class TradingAnalytics:
             save_path: Optional path to save the plot
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db.session as conn:
                 df = pd.read_sql_query("SELECT * FROM trades", conn)
                 df['entry_time'] = pd.to_datetime(df['entry_time'])
                 
@@ -614,7 +568,7 @@ class TradingAnalytics:
             Dictionary containing pattern analysis results
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db.session as conn:
                 df = pd.read_sql_query("SELECT * FROM trades", conn)
                 df['entry_time'] = pd.to_datetime(df['entry_time'])
                 

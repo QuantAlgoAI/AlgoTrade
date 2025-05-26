@@ -1,0 +1,30 @@
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
+.venv/
+
+# Ignore version control
+.git/
+
+# Ignore logs and reports
+logs/
+reports/
+
+# Ignore local environment and config files
+.env
+.env.*
+
+# Ignore large data files
+*.csv
+*.db
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore test outputs
+*.pytest_cache/
+
+# Ignore other unnecessary files
+*.bak
+*.swp 

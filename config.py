@@ -7,6 +7,16 @@ from pathlib import Path
 env_path = Path('.') / '.env'
 load_dotenv(dotenv_path=env_path)
 
+API_KEY = os.getenv('API_KEY')
+CLIENT_CODE = os.getenv('CLIENT_CODE')
+PASSWORD = os.getenv('PASSWORD')
+TOTP_SECRET = os.getenv('TOTP_SECRET')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+STRATEGY_NAME = os.getenv('STRATEGY_NAME', 'HighWinRateStrategy')
+
+# Add any other config variables as needed
+
 class Config:
     """Main configuration class."""
     

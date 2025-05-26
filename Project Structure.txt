@@ -8,10 +8,14 @@ Project Structure Report
 
 |-- MS/
 |   |-- .env
-|   |-- 20250522_instrument_file.csv
+|   |-- .env.example
+|   |-- .gitignore
+|   |-- 20250523_instrument_file.csv
+|   |-- 20250526_instrument_file.csv
 |   |-- AlgoTrade.py
+|   |-- analytics.py
 |   |-- ARCHITECTURE.md
-|   |-- backup.py
+|   |-- AsyncHigh-SpeedBackupScript.py
 |   |-- config.py
 |   |-- docker-compose.yml
 |   |-- Dockerfile
@@ -22,8 +26,16 @@ Project Structure Report
 |   |-- run_trading_bot.bat
 |   |-- security.py
 |   |-- setup_wsl.bat
+|   |-- tatus
+|   |-- trading_analytics.db
+|   |-- trading_bot.db
 |   |-- verify_wsl.bat
+|   |-- .github/
+|   |   |-- workflows/
+|   |   |   |-- main.yml
 |   |-- data_cache/
+|   |-- instance/
+|   |   |-- trading_bot.db
 |   |-- logs/
 |   |   |-- trading_20250521.log
 |   |   |-- trading_20250522.log
@@ -41,9 +53,24 @@ Project Structure Report
 |   |   |   |-- app.log
 |   |   |-- 2025-05-22/
 |   |   |   |-- app.log
+|   |   |-- 2025-05-23/
+|   |   |   |-- app.log
+|   |   |-- 2025-05-26/
+|   |   |   |-- app.log
+|   |-- reports/
+|   |   |-- performance_report_20250522.html
+|   |-- strategies/
+|   |   |-- advanced_strategies.py
+|   |   |-- base_strategy.py
+|   |   |-- strategy.md
+|   |   |-- __pycache__/
+|   |   |   |-- advanced_strategies.cpython-311.pyc
+|   |   |   |-- base_strategy.cpython-311.pyc
 |   |-- __pycache__/
 |   |   |-- AlgoTrade.cpython-311.pyc
+|   |   |-- analytics.cpython-311.pyc
 |   |   |-- api_utils.cpython-311.pyc
+|   |   |-- azure_storage.cpython-311.pyc
 |   |   |-- config.cpython-311.pyc
 |   |   |-- database.cpython-311.pyc
 |   |   |-- models.cpython-311.pyc
@@ -53,6 +80,8 @@ Project Structure Report
 |   |   |-- option_chain_monitor.cpython-311.pyc
 
 Duplicate Files:
-- app.log (found 7 times)
+- trading_bot.db (found 2 times)
+- app.log (found 9 times)
 
 Duplicate Folders:
+- __pycache__ (found 2 times)
